@@ -2,7 +2,7 @@ package TheSchwartz::Simple;
 
 use strict;
 use 5.8.1;
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 use Carp;
 use Scalar::Util qw( refaddr );
@@ -16,6 +16,7 @@ sub new {
     bless {
         databases => $dbhs,
         _funcmap  => {},
+        prefix    => "",
     }, $class;
 }
 
@@ -40,11 +41,20 @@ sub insert {
             my $row = $job->as_hashref;
             my @col = keys %$row;
 
-            my $sql = sprintf 'INSERT INTO job (%s) VALUES (%s)',
+            my $sql = sprintf 'INSERT INTO %sjob (%s) VALUES (%s)',
+                $self->{prefix},
                 join( ", ", @col ), join( ", ", ("?") x @col );
 
             my $sth = $dbh->prepare_cached($sql);
-            $sth->execute( @$row{@col} );
+            my $i = 1;
+            for my $col (@col) {
+                $sth->bind_param(
+                    $i++,
+                    $row->{$col},
+                    _bind_param_attr( $dbh, $col ),
+                );
+            }
+            $sth->execute();
 
             $jobid = _insert_id( $dbh, $sth, "job", "jobid" );
         };
@@ -61,7 +71,7 @@ sub funcname_to_id {
     my $dbid = refaddr $dbh;
     unless ( exists $self->{_funcmap}{$dbid} ) {
         my $sth
-            = $dbh->prepare_cached('SELECT funcid, funcname FROM funcmap');
+            = $dbh->prepare_cached("SELECT funcid, funcname FROM $self->{prefix}funcmap");
         $sth->execute;
         while ( my $row = $sth->fetchrow_arrayref ) {
             $self->{_funcmap}{$dbid}{ $row->[1] } = $row->[0];
@@ -72,7 +82,7 @@ sub funcname_to_id {
     unless ( exists $self->{_funcmap}{$dbid}{$funcname} ) {
         ## This might fail in a race condition since funcname is UNIQUE
         my $sth = $dbh->prepare_cached(
-            'INSERT INTO funcmap (funcname) VALUES (?)');
+            "INSERT INTO $self->{prefix}funcmap (funcname) VALUES (?)");
         eval { $sth->execute($funcname) };
 
         my $id = _insert_id( $dbh, $sth, "funcmap", "funcid" );
@@ -80,7 +90,7 @@ sub funcname_to_id {
         ## If we got an exception, try to load the record again
         if ($@) {
             my $sth = $dbh->prepare_cached(
-                'SELECT funcid FROM funcmap WHERE funcname = ?');
+                "SELECT funcid FROM $self->{prefix}funcmap WHERE funcname = ?");
             $sth->execute($funcname);
             $id = $sth->fetchrow_arrayref->[0]
                 or croak "Can't find or create funcname $funcname: $@";
@@ -142,7 +152,7 @@ sub list_jobs {
         eval {
             my $funcid = $self->funcname_to_id( $dbh, $arg->{funcname} );
 
-            my $sql   = 'SELECT * FROM job WHERE funcid = ?';
+            my $sql   = "SELECT * FROM $self->{prefix}job WHERE funcid = ?";
             my @value = ($funcid);
             for (@options) {
                 $sql .= " AND $_->{key} $_->{op} ?";
@@ -159,6 +169,29 @@ sub list_jobs {
 
     return @jobs;
 }
+
+sub _bind_param_attr {
+    my ( $dbh, $col ) = @_;
+
+    return if $col ne 'arg';
+
+    my $driver = $dbh->{Driver}{Name};
+    if ( $driver eq 'Pg' ) {
+        return { pg_type => DBD::Pg::PG_BYTEA() };
+    }
+    elsif ( $driver eq 'SQLite' ) {
+        return DBI::SQL_BLOB();
+    }
+    return;
+}
+
+sub prefix {
+    my $self = shift;
+
+    $self->{prefix} = shift if @_;
+    return $self->{prefix};
+}
+
 
 1;
 __END__
@@ -178,6 +211,7 @@ TheSchwartz::Simple - Lightweight TheSchwartz job dispatcher using plain DBI
 
   my $dbh = DBI->connect(...);
   my $client = TheSchwartz::Simple->new([ $dbh ]);
+  $client->prefix("theschwartz_"); # optional
   my $job_id = $client->insert('funcname', $arg);
 
   my $job = TheSchwartz::Simple::Job->new;
